@@ -607,8 +607,12 @@ function Read-StateFile {
         throw "状态文件无法读取或解析：$($_.Exception.Message)（$script:StatePath）。为避免误恢复，已停止。"
     }
 
-    if ($null -eq $state -or $null -eq $state.PSObject.Properties['SchemaVersion'] -or [int]$state.SchemaVersion -ne 1) {
+    if ($null -eq $state -or $null -eq $state.PSObject.Properties['SchemaVersion']) {
         throw "状态文件版本不受支持：$script:StatePath"
+    }
+    $schemaVersion = [int]$state.SchemaVersion
+    if ($schemaVersion -notin @(1, 2)) {
+        throw "状态文件版本不受支持：$script:StatePath（SchemaVersion=$schemaVersion）"
     }
 
     if ($null -eq $state.PSObject.Properties['MachineGuid']) {
@@ -640,6 +644,25 @@ function Read-StateFile {
         }
     }
 
+    if ($null -eq $state.Rdp.PSObject.Properties['LastApplied']) {
+        if ($schemaVersion -ge 2) {
+            throw "状态文件缺少 LastApplied 字段：$script:StatePath"
+        }
+        $state.Rdp | Add-Member -NotePropertyName 'LastApplied' -NotePropertyValue ([pscustomobject]@{
+            fDenyTSConnections = 0
+            UserAuthentication = 1
+        }) -Force
+    }
+    foreach ($appliedName in @('fDenyTSConnections', 'UserAuthentication')) {
+        if ($null -eq $state.Rdp.LastApplied.PSObject.Properties[$appliedName]) {
+            throw "状态文件缺少工具写入值字段 '$appliedName'：$script:StatePath"
+        }
+        $appliedValue = [int]$state.Rdp.LastApplied.PSObject.Properties[$appliedName].Value
+        if ($appliedValue -notin @(0, 1)) {
+            throw "状态文件中的工具写入值无效（$appliedName=$appliedValue）：$script:StatePath"
+        }
+    }
+    $state.SchemaVersion = 2
     return $state
 }
 
@@ -659,6 +682,10 @@ function Save-StateFile {
 
     Initialize-StateDirectoryAcl -Path $script:StateDirectory
 
+    if ($null -eq $State.PSObject.Properties['SchemaVersion']) {
+        throw '内部错误：状态对象缺少 SchemaVersion。'
+    }
+    $State.SchemaVersion = 2
     $State.LastUpdatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $json = $State | ConvertTo-Json -Depth 10
     $tempPath = $script:StatePath + '.tmp'
@@ -679,6 +706,28 @@ function Save-StateFile {
     }
 }
 
+function Set-RdpStateAppliedValue {
+    param(
+        $State,
+        [string]$Name,
+        [int]$Value
+    )
+    if ($Name -notin @('fDenyTSConnections', 'UserAuthentication')) {
+        throw "内部错误：不支持记录注册表值 '$Name'。"
+    }
+    if ($Value -notin @(0, 1)) {
+        throw "内部错误：注册表工具写入值无效（$Name=$Value）。"
+    }
+    if ($null -eq $State.Rdp.PSObject.Properties['LastApplied']) {
+        $State.Rdp | Add-Member -NotePropertyName 'LastApplied' -NotePropertyValue ([pscustomobject]@{
+            fDenyTSConnections = 0
+            UserAuthentication = 1
+        }) -Force
+    }
+    $State.Rdp.LastApplied | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+    $State.SchemaVersion = 2
+}
+
 function New-ConfigSnapshot {
     $rdp = Get-RdpRegistryState
     $service = Get-TermServiceInfo
@@ -690,7 +739,7 @@ function New-ConfigSnapshot {
     }
 
     return [pscustomobject]@{
-        SchemaVersion       = 1
+        SchemaVersion       = 2
         MachineGuid         = Get-MachineGuid
         ComputerName        = $env:COMPUTERNAME
         CreatedAt           = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -700,6 +749,10 @@ function New-ConfigSnapshot {
             UserAuthentication = $rdp.Nla
             PortNumber         = $rdp.Port
             SecurityLayer      = $rdp.SecurityLayer
+            LastApplied        = [pscustomobject]@{
+                fDenyTSConnections = 0
+                UserAuthentication = 1
+            }
         }
         TermService         = [pscustomobject]@{
             StartupTypeBefore  = $service.StartType
@@ -1737,6 +1790,9 @@ function Invoke-EnableRdp {
     Write-Section '应用配置'
     Initialize-TermService -State $state
     Set-RdpRegistryEnabled
+    Set-RdpStateAppliedValue -State $state -Name 'fDenyTSConnections' -Value 0
+    Set-RdpStateAppliedValue -State $state -Name 'UserAuthentication' -Value 1
+    Save-StateFile -State $state
     Ensure-RdpListener -State $state -WasRdpEnabled ([bool]$rdpBefore.RdpEnabled)
 
     $password = New-SecurePassword -Length 24
@@ -2121,7 +2177,7 @@ function Restore-RdpRegistryValue {
         return [pscustomobject]@{
             Label   = $Label
             Status  = 'Skipped'
-            Message = '当前值与快照和本工具写入值都不同，可能已被管理员修改；未覆盖。'
+            Message = '当前值与快照和本工具最新写入值都不同，可能已被管理员修改；未覆盖。'
         }
     }
 
@@ -2182,15 +2238,26 @@ function Restore-RdpRegistryState {
                     throw "$($target.Label) 的快照值无效：$snapshotValue。为避免写入错误配置，未恢复该项。"
                 }
             }
+            $appliedValue = [int]$target.Applied
+            if ($null -ne $State.Rdp.PSObject.Properties['LastApplied'] -and
+                $null -ne $State.Rdp.LastApplied.PSObject.Properties[$target.Name]) {
+                $appliedValue = [int]$State.Rdp.LastApplied.PSObject.Properties[$target.Name].Value
+            }
+            if ($appliedValue -notin @(0, 1)) {
+                throw "$($target.Label) 的本工具最新写入值无效：$appliedValue。为避免错误覆盖，未恢复该项。"
+            }
             $restoreParams = @{
                 Label        = $target.Label
                 Path         = $target.Path
                 Name         = $target.Name
-                AppliedValue = $target.Applied
+                AppliedValue = $appliedValue
                 Snapshot     = $target.Snapshot
             }
             $result = Restore-RdpRegistryValue @restoreParams
             $results.Add($result)
+            if ($result.Status -in @('Restored', 'AlreadyOriginal') -and [bool]$target.Snapshot.Exists) {
+                Set-RdpStateAppliedValue -State $State -Name $target.Name -Value ([int]$target.Snapshot.Value)
+            }
         } catch {
             $results.Add([pscustomobject]@{
                 Label   = $target.Label
@@ -2388,6 +2455,19 @@ function Invoke-DisableRdpCore {
     if ($policyAfter.fDenyTSConnections -eq 0) {
         $errors.Add('组策略仍将 fDenyTSConnections 固定为 0；RDP 可能被策略重新启用。')
         $result.RdpClosed = $false
+    }
+
+    if ($result.RdpClosed -and $result.SnapshotExists) {
+        try {
+            $state = Read-StateFile
+            if ($null -eq $state) {
+                throw '状态快照在关闭过程中消失。'
+            }
+            Set-RdpStateAppliedValue -State $state -Name 'fDenyTSConnections' -Value 1
+            Save-StateFile -State $state
+        } catch {
+            $errors.Add("更新状态快照中的最新写入值失败：$($_.Exception.Message)")
+        }
     }
 
     $rules = @(Get-ManagedFirewallRules)
@@ -2637,6 +2717,14 @@ function Invoke-RestoreOriginal {
         } catch {
             Write-Err "删除状态快照失败：$($_.Exception.Message)"
             $errors.Add("删除状态快照失败：$($_.Exception.Message)")
+        }
+    } elseif ($null -ne $state) {
+        try {
+            Save-StateFile -State $state
+            Write-Info '状态快照保留，并已更新本工具最新写入值。'
+        } catch {
+            Write-Err "保存状态快照失败：$($_.Exception.Message)"
+            $errors.Add("保存状态快照失败：$($_.Exception.Message)")
         }
     }
 

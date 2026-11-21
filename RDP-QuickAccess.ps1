@@ -19,8 +19,13 @@
 #>
 [CmdletBinding()]
 param(
+    [switch]$Enable,
+    [switch]$DisableRdp,
+    [switch]$DeleteAccount,
+    [switch]$DisableAndDelete,
     [switch]$Status,
-    [switch]$Disable,
+    [Alias('Disable')]
+    [switch]$RestoreOriginal,
     [Alias('h')]
     [switch]$Help
 )
@@ -826,6 +831,96 @@ function Get-RdpAccountInfo {
         PasswordRequired      = [bool]$user.PasswordRequired
         UserMayChangePassword = [bool]$user.UserMayChangePassword
     }
+}
+
+function Get-RdpAccountSessionInfo {
+    $result = [pscustomobject]@{
+        Checked  = $false
+        InUse    = $false
+        Sessions = @()
+        Errors   = @()
+    }
+    $sessions = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $checked = $false
+
+    try {
+        $associations = @(Get-CimInstance -ClassName Win32_LoggedOnUser -ErrorAction Stop)
+        $logonSessions = @(Get-CimInstance -ClassName Win32_LogonSession -ErrorAction Stop)
+        $logonMap = @{}
+        foreach ($logon in $logonSessions) {
+            $logonMap[[string]$logon.LogonId] = $logon
+        }
+        foreach ($association in $associations) {
+            if ($null -eq $association.Antecedent) { continue }
+            $name = [string]$association.Antecedent.Name
+            if ($name -ne $script:AccountName) { continue }
+            $domain = [string]$association.Antecedent.Domain
+            if (-not [string]::IsNullOrWhiteSpace($domain) -and $domain -ne $env:COMPUTERNAME -and $domain -ne '.') {
+                continue
+            }
+            $logonId = [string]$association.Dependent.LogonId
+            if (-not $logonMap.ContainsKey($logonId)) { continue }
+            $logon = $logonMap[$logonId]
+            $logonType = [int]$logon.LogonType
+            if ($logonType -in @(2, 3, 7, 10, 11)) {
+                $sessions.Add([pscustomobject]@{
+                    Source    = 'Win32_LogonSession'
+                    LogonId   = $logonId
+                    LogonType = $logonType
+                    StartTime = $logon.StartTime
+                })
+            }
+        }
+        $checked = $true
+    } catch {
+        $errors.Add("CIM 登录会话检查失败：$($_.Exception.Message)")
+    }
+
+    try {
+        $quserOutput = @(& quser 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            $checked = $true
+            $pattern = '(?i)(^|[\s>])' + [regex]::Escape($script:AccountName) + '([\s]|$)'
+            foreach ($line in $quserOutput) {
+                if ([string]$line -match $pattern) {
+                    $sessions.Add([pscustomobject]@{
+                        Source    = 'quser'
+                        LogonId   = ''
+                        LogonType = ''
+                        StartTime = ''
+                        Detail    = ([string]$line).Trim()
+                    })
+                }
+            }
+        }
+    } catch {
+        $errors.Add("quser 会话检查失败：$($_.Exception.Message)")
+    }
+
+    try {
+        $processes = @(Get-Process -IncludeUserName -ErrorAction Stop | Where-Object {
+            $_.UserName -and ([string]$_.UserName).ToLowerInvariant().EndsWith('\' + $script:AccountName.ToLowerInvariant())
+        })
+        $checked = $true
+        foreach ($process in $processes) {
+            $sessions.Add([pscustomobject]@{
+                Source    = 'Process'
+                LogonId   = ''
+                LogonType = ''
+                StartTime = ''
+                Detail    = ("进程 {0}（PID {1}）" -f $process.ProcessName, $process.Id)
+            })
+        }
+    } catch {
+        # 非管理员或系统限制时可能无法读取进程用户；CIM/quser 仍可提供会话信息。
+    }
+
+    $result.Checked = $checked
+    $result.Sessions = $sessions.ToArray()
+    $result.InUse = ($sessions.Count -gt 0)
+    $result.Errors = $errors.ToArray()
+    return $result
 }
 
 function Initialize-RdpAccount {
@@ -1718,16 +1813,24 @@ function Invoke-Status {
     $ruleOk = ($rules.Count -eq 1 -and $ruleErrors.Count -eq 0)
 
     $overall = '未启用'
-    if ($rdp.RdpEnabled -and $rdp.NlaEnabled -and $listener -and $ruleOk -and $accountOk) {
-        $overall = '已启用（本工具配置完整）'
-    } elseif ($rdp.RdpEnabled) {
-        $overall = 'RDP 已启用，但本工具配置不完整'
+    if ($rdp.RdpEnabled) {
+        if ($rdp.NlaEnabled -and $listener -and $ruleOk -and $accountOk) {
+            $overall = 'RDP 已启用，工具配置完整'
+        } else {
+            $overall = 'RDP 已启用，但本工具配置不完整'
+        }
+    } else {
+        if ($account.Exists -and $account.DescriptionMatches) {
+            $overall = 'RDP 已关闭，专用账户仍保留'
+        } elseif (-not $account.Exists) {
+            $overall = 'RDP 已关闭，专用账户已删除'
+        } else {
+            $overall = 'RDP 已关闭'
+        }
     }
 
-    if ($overall -eq '已启用（本工具配置完整）') {
+    if ($overall -eq 'RDP 已启用，工具配置完整') {
         Write-Kv '状态' $overall Green
-    } elseif ($rdp.RdpEnabled) {
-        Write-Kv '状态' $overall Yellow
     } else {
         Write-Kv '状态' $overall Yellow
     }
@@ -1950,7 +2053,11 @@ function Invoke-Status {
         $riskCount++
     }
     if ($null -eq $state -and ($rdp.RdpEnabled -or $rules.Count -gt 0 -or $account.Exists)) {
-        Write-Warn '检测到 RDP/账户/规则，但没有状态快照；-Disable 无法恢复原始注册表配置。'
+        Write-Warn '检测到 RDP/账户/规则，但没有状态快照；-RestoreOriginal 无法恢复原始注册表配置。'
+        $riskCount++
+    }
+    if ($rdp.RdpEnabled -and -not $account.Exists -and $rules.Count -eq 0) {
+        Write-Warn '检测到 RDP 已启用，但没有本工具账户或防火墙规则；可能由其他方式配置。'
         $riskCount++
     }
     if ($null -ne $stateAcl -and $stateAcl.Exists -and $stateAcl.UsersWrite) {
@@ -2144,11 +2251,194 @@ function Restore-TermServiceStartup {
     }
 }
 
-function Invoke-DisableRdp {
+function Invoke-DeleteAccountCore {
+    $result = [pscustomobject]@{
+        Success       = $false
+        Deleted       = $false
+        AccountExists = $false
+        Reason        = ''
+        Message       = ''
+        Sessions      = @()
+        AdminRemoved  = $false
+    }
+
+    $account = Get-RdpAccountInfo
+    if (-not $account.Exists) {
+        $result.Success = $true
+        $result.Reason = 'NotFound'
+        $result.Message = "账户 $($script:AccountName) 不存在（可能已删除）。"
+        return $result
+    }
+    $result.AccountExists = $true
+
+    if (-not $account.DescriptionMatches) {
+        $result.Reason = 'OwnershipMismatch'
+        $result.Message = "同名账户存在，但说明字段不是 '$($script:ManagedDescription)'（当前：'$($account.Description)'）。不会删除其他账户。"
+        return $result
+    }
+
+    $state = $null
+    $stateError = $null
+    try {
+        $state = Read-StateFile
+    } catch {
+        $stateError = $_.Exception.Message
+    }
+    if ($null -eq $state -and $null -ne $stateError) {
+        $result.Reason = 'StateUnavailable'
+        $result.Message = "状态快照存在但无法读取，无法验证 AccountSid：$stateError"
+        return $result
+    }
+    if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.AccountSid)) {
+        if ([string]$account.Sid -ne [string]$state.AccountSid) {
+            $result.Reason = 'SidMismatch'
+            $result.Message = "状态快照记录的 AccountSid（$($state.AccountSid)）与当前账户 SID（$($account.Sid)）不一致。不会删除。"
+            return $result
+        }
+    }
+
+    if ($account.InAdministrators) {
+        try {
+            Remove-LocalGroupMember -SID $script:AdministratorsSid -Member $script:AccountName -Confirm:$false -ErrorAction Stop
+            $adminCheck = Get-RdpAccountInfo
+            if ($adminCheck.InAdministrators) {
+                throw '账户仍在 Administrators 组中。'
+            }
+            $result.AdminRemoved = $true
+        } catch {
+            $result.Reason = 'AdminRemovalFailed'
+            $result.Message = "账户仍位于 Administrators 组，且移除失败：$($_.Exception.Message)"
+            return $result
+        }
+    }
+
+    $sessionInfo = Get-RdpAccountSessionInfo
+    $result.Sessions = @($sessionInfo.Sessions)
+    if (-not $sessionInfo.Checked) {
+        $result.Reason = 'SessionCheckFailed'
+        $result.Message = '无法确认账户的本地/远程登录会话状态。为避免误删，已拒绝删除。'
+        return $result
+    }
+    if ($sessionInfo.InUse) {
+        $result.Reason = 'ActiveSessions'
+        $result.Message = '账户仍存在本地登录、远程桌面或未注销会话。请先正常注销后再删除。'
+        return $result
+    }
+
+    try {
+        Remove-LocalUser -Name $script:AccountName -Confirm:$false -ErrorAction Stop
+        $after = Get-RdpAccountInfo
+        if ($after.Exists) {
+            throw '账户删除后仍然存在。'
+        }
+        $result.Success = $true
+        $result.Deleted = $true
+        $result.Reason = 'Deleted'
+        $result.Message = "已删除本工具管理的账户 $($script:AccountName)。"
+    } catch {
+        $result.Reason = 'DeleteFailed'
+        $result.Message = "删除账户失败：$($_.Exception.Message)"
+    }
+    return $result
+}
+
+function Invoke-DisableRdpCore {
+    $result = [pscustomobject]@{
+        Success              = $false
+        RdpClosed            = $false
+        FirewallRuleRemoved  = $false
+        ManagedRuleRemaining = $false
+        RuleStatus           = 'Unknown'
+        AccountExists        = $false
+        SnapshotExists       = $false
+        NlaEnabled           = $false
+        ListenerActive       = $false
+        Errors               = @()
+        Warnings             = @()
+    }
+    $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $warnings = New-Object -TypeName 'System.Collections.Generic.List[string]'
+
+    $result.AccountExists = (Get-RdpAccountInfo).Exists
+    $result.SnapshotExists = (Test-Path -LiteralPath $script:StatePath -PathType Leaf)
+    $rdpBefore = Get-RdpRegistryState
+    $result.NlaEnabled = [bool]$rdpBefore.NlaEnabled
+    $result.ListenerActive = Test-RdpListener
+
+    $policy = Get-RdpPolicyState
+    if ($policy.fDenyTSConnections -eq 0) {
+        $errors.Add('组策略将 fDenyTSConnections 固定为 0，强制启用 RDP。本工具不会修改组策略，无法保证关闭。')
+        $result.Errors = $errors.ToArray()
+        $result.Warnings = $warnings.ToArray()
+        return $result
+    }
+
+    try {
+        Set-ItemProperty -LiteralPath $script:TsKey -Name 'fDenyTSConnections' -Value 1 -Type DWord -ErrorAction Stop
+        $after = Get-RdpRegistryState
+        if (-not [bool]$after.Deny.Exists -or [int]$after.Deny.Value -ne 1) {
+            throw '写入 fDenyTSConnections=1 后验证失败。'
+        }
+        $result.RdpClosed = $true
+    } catch {
+        $errors.Add("关闭 RDP 失败：$($_.Exception.Message)")
+    }
+
+    $policyAfter = Get-RdpPolicyState
+    if ($policyAfter.fDenyTSConnections -eq 0) {
+        $errors.Add('组策略仍将 fDenyTSConnections 固定为 0；RDP 可能被策略重新启用。')
+        $result.RdpClosed = $false
+    }
+
+    $rules = @(Get-ManagedFirewallRules)
+    $removed = 0
+    $conflict = $false
+    if ($rules.Count -eq 0) {
+        $result.FirewallRuleRemoved = $true
+        $result.RuleStatus = 'NotPresent'
+    } else {
+        foreach ($rule in $rules) {
+            if ([string]$rule.Description -cne $script:ManagedDescription) {
+                $warnings.Add("同名防火墙规则 '$($script:FirewallRuleName)' 不属于本工具，已保留。")
+                $conflict = $true
+                continue
+            }
+            try {
+                Remove-NetFirewallRule -Name $rule.Name -Confirm:$false -ErrorAction Stop
+                $removed++
+            } catch {
+                $errors.Add("删除防火墙规则失败：$($_.Exception.Message)")
+            }
+        }
+        $remainingRules = @(Get-ManagedFirewallRules)
+        $remainingOurs = @($remainingRules | Where-Object { [string]$_.Description -ceq $script:ManagedDescription })
+        if ($remainingOurs.Count -gt 0) {
+            $result.ManagedRuleRemaining = $true
+            $result.RuleStatus = 'Remaining'
+            $errors.Add("仍有 $($remainingOurs.Count) 条本工具防火墙规则未删除。")
+        } elseif ($removed -gt 0) {
+            $result.FirewallRuleRemoved = $true
+            $result.RuleStatus = 'Removed'
+        } elseif ($conflict) {
+            $result.FirewallRuleRemoved = $true
+            $result.RuleStatus = 'Conflict'
+        } else {
+            $result.FirewallRuleRemoved = $true
+            $result.RuleStatus = 'NotPresent'
+        }
+    }
+
+    $result.Errors = $errors.ToArray()
+    $result.Warnings = $warnings.ToArray()
+    $result.Success = ($errors.Count -eq 0 -and $result.RdpClosed -and -not $result.ManagedRuleRemaining)
+    return $result
+}
+
+function Invoke-RestoreOriginal {
     Assert-Administrator
     Assert-Prerequisites
 
-    Write-Banner 'DISABLE'
+    Write-Banner 'RESTORE ORIGINAL'
 
     $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $warnings = New-Object -TypeName 'System.Collections.Generic.List[string]'
@@ -2242,29 +2532,64 @@ function Invoke-DisableRdp {
     }
 
     Write-Section '移除专用账户'
-    $account = Get-RdpAccountInfo
-    $managedAccount = ($account.Exists -and $account.DescriptionMatches)
-    $accountDeleteFailed = $false
-    if (-not $account.Exists) {
-        Write-Info "账户 $($script:AccountName) 不存在（可能已删除）。"
-    } elseif (-not $account.DescriptionMatches) {
-        Write-Warn "账户 $($script:AccountName) 存在，但说明字段不匹配（当前：'$($account.Description)'）。已跳过，不会删除其他账户。"
-        $warnings.Add('同名账户说明字段不匹配，未删除。')
-    } else {
-        try {
-            Remove-LocalUser -Name $script:AccountName -Confirm:$false -ErrorAction Stop
-            Write-Ok "已删除本工具创建的账户 $($script:AccountName)。"
-            $actions.Add("删除账户 $($script:AccountName)")
-        } catch {
-            $accountDeleteFailed = $true
-            Write-Err "删除账户 $($script:AccountName) 失败：$($_.Exception.Message)"
-            $errors.Add("删除账户失败：$($_.Exception.Message)")
-        }
+    $accountDelete = $null
+    try {
+        $accountDelete = Invoke-DeleteAccountCore
+    } catch {
+        Write-Err "删除账户失败：$($_.Exception.Message)"
+        $errors.Add("删除账户失败：$($_.Exception.Message)")
     }
-    if ($managedAccount -and -not $accountDeleteFailed) {
-        $afterAccount = Get-RdpAccountInfo
-        if ($afterAccount.Exists) {
-            $errors.Add("账户 $($script:AccountName) 删除后仍然存在。")
+    if ($null -ne $accountDelete) {
+        if ($accountDelete.AdminRemoved) {
+            Write-Warn '账户原先位于 Administrators 组，已将其移除。'
+            $warnings.Add('账户原先位于 Administrators 组，已移除其管理员成员资格。')
+        }
+        switch ($accountDelete.Reason) {
+            'Deleted' {
+                Write-Ok $accountDelete.Message
+                $actions.Add("删除账户 $($script:AccountName)")
+            }
+            'NotFound' {
+                Write-Info $accountDelete.Message
+            }
+            'ActiveSessions' {
+                Write-Warn $accountDelete.Message
+                foreach ($session in @($accountDelete.Sessions)) {
+                    if ($session.Detail) {
+                        Write-Host ("  - {0}：{1}" -f $session.Source, $session.Detail) -ForegroundColor Yellow
+                    } elseif ($session.LogonType) {
+                        Write-Host ("  - {0}：LogonId={1}，LogonType={2}" -f $session.Source, $session.LogonId, $session.LogonType) -ForegroundColor Yellow
+                    }
+                }
+                $warnings.Add('专用账户存在活动/未注销会话，未删除。')
+            }
+            'OwnershipMismatch' {
+                Write-Warn $accountDelete.Message
+                $warnings.Add('同名账户说明字段不匹配，未删除。')
+            }
+            'SidMismatch' {
+                Write-Warn $accountDelete.Message
+                $warnings.Add('账户 SID 与快照不一致，未删除。')
+            }
+            'StateUnavailable' {
+                Write-Warn $accountDelete.Message
+                $warnings.Add('状态快照不可读，未删除账户。')
+            }
+            'SessionCheckFailed' {
+                Write-Warn $accountDelete.Message
+                $warnings.Add('无法确认账户会话状态，未删除账户。')
+            }
+            'AdminRemovalFailed' {
+                Write-Err $accountDelete.Message
+                $errors.Add($accountDelete.Message)
+            }
+            'DeleteFailed' {
+                Write-Err $accountDelete.Message
+                $errors.Add($accountDelete.Message)
+            }
+            default {
+                $warnings.Add("删除账户返回未知状态：$($accountDelete.Reason)")
+            }
         }
     }
 
@@ -2372,6 +2697,222 @@ function Invoke-DisableRdp {
     return ($errors.Count -eq 0 -and $warnings.Count -eq 0)
 }
 
+function Invoke-DisableRdp {
+    Assert-Administrator
+    Assert-Prerequisites
+
+    $result = Invoke-DisableRdpCore
+    Write-Banner 'DISABLED'
+
+    if ($result.RdpClosed) {
+        Write-Kv 'RDP' '已关闭' Green
+    } else {
+        Write-Kv 'RDP' '关闭失败' Red
+    }
+    if ($result.NlaEnabled) {
+        Write-Kv 'NLA' '未主动削弱（当前已启用）' Green
+    } else {
+        Write-Kv 'NLA' '未主动削弱（当前未启用，本操作未修改）' Yellow
+    }
+    switch ($result.RuleStatus) {
+        'Removed' {
+            Write-Kv '防火墙规则' '已移除' Green
+        }
+        'NotPresent' {
+            Write-Kv '防火墙规则' '不存在（无需移除）' Green
+        }
+        'Conflict' {
+            Write-Kv '防火墙规则' '本工具规则不存在；同名非本工具规则已保留' Yellow
+        }
+        'Remaining' {
+            Write-Kv '防火墙规则' '未完全移除' Red
+        }
+        default {
+            Write-Kv '防火墙规则' '状态未知' Yellow
+        }
+    }
+    if ($result.AccountExists) {
+        Write-Kv '专用账户' '仍保留' Yellow
+    } else {
+        Write-Kv '专用账户' '不存在（未创建）' Green
+    }
+    if ($result.SnapshotExists) {
+        Write-Kv '状态快照' '已保留' Green
+    } else {
+        Write-Kv '状态快照' '无状态快照' Yellow
+    }
+
+    Write-Host ''
+    Write-Host '说明：' -ForegroundColor Cyan
+    Write-Host '  当前已禁止新的 RDP 连接。已有 RDP 会话可能仍然存在；本操作不会强制注销。'
+    Write-Host '  如果需要重新开启，请运行 RDP-Enable.bat。'
+    Write-Host '  如果需要删除专用账户，请运行 RDP-Delete-Account.bat。'
+    if ($result.ListenerActive) {
+        Write-Host '  TCP 3389 监听可能仍然存在；TermService 未被强制停止。' -ForegroundColor DarkGray
+    }
+
+    if ($result.Warnings.Count -gt 0) {
+        Write-Host ''
+        Write-Host '警告：' -ForegroundColor Yellow
+        foreach ($warning in @($result.Warnings)) { Write-Host "  - $warning" -ForegroundColor Yellow }
+    }
+    if ($result.Errors.Count -gt 0) {
+        Write-Host ''
+        Write-Host '错误：' -ForegroundColor Red
+        foreach ($errorItem in @($result.Errors)) { Write-Host "  - $errorItem" -ForegroundColor Red }
+        Write-Kv '状态' 'RDP 关闭或规则清理未完全成功' Red
+    } elseif ($result.RdpClosed) {
+        Write-Kv '状态' '已关闭' Green
+    } else {
+        Write-Kv '状态' '关闭失败' Red
+    }
+    return $result.Success
+}
+
+function Invoke-DeleteAccount {
+    Assert-Administrator
+    Assert-Prerequisites
+
+    $result = Invoke-DeleteAccountCore
+    Write-Banner 'DELETE ACCOUNT'
+
+    switch ($result.Reason) {
+        'Deleted' {
+            Write-Kv '状态' '已删除' Green
+            Write-Kv '账户' $script:AccountName
+            Write-Kv '归属验证' '通过' Green
+            Write-Kv '活动会话' '无' Green
+        }
+        'NotFound' {
+            Write-Kv '状态' '账户不存在（可能已删除）' Green
+            Write-Kv '账户' $script:AccountName
+        }
+        'ActiveSessions' {
+            Write-Kv '状态' '未删除（存在活动会话）' Yellow
+            Write-Kv '账户' $script:AccountName
+            foreach ($session in @($result.Sessions)) {
+                if ($session.Detail) {
+                    Write-Host ("  - {0}：{1}" -f $session.Source, $session.Detail) -ForegroundColor Yellow
+                } elseif ($session.LogonType) {
+                    Write-Host ("  - {0}：LogonId={1}，LogonType={2}" -f $session.Source, $session.LogonId, $session.LogonType) -ForegroundColor Yellow
+                }
+            }
+            Write-Host '  请先正常注销该账户的本地/远程会话；本工具不会强制踢出会话。' -ForegroundColor Yellow
+        }
+        default {
+            Write-Kv '状态' '未删除' Red
+            Write-Host ("  {0}" -f $result.Message) -ForegroundColor Red
+        }
+    }
+
+    if ($result.AdminRemoved) {
+        Write-Warn '账户原先位于 Administrators 组，已移除其管理员成员资格。'
+    }
+    Write-Host ''
+    Write-Kv '用户配置文件' '保留（未删除）'
+    Write-Kv 'RDP 状态' '未修改'
+    Write-Kv '防火墙规则' '未修改'
+    Write-Kv '状态快照' '保留'
+    Write-Host ''
+    Write-Host '说明：单独删除账户不会关闭 RDP；其他有权限的 Windows 账户仍可能使用 RDP。' -ForegroundColor DarkGray
+    return $result.Success
+}
+
+function Invoke-DisableAndDelete {
+    Assert-Administrator
+    Assert-Prerequisites
+
+    $disable = Invoke-DisableRdpCore
+    $delete = Invoke-DeleteAccountCore
+    $allOk = ($disable.Success -and $delete.Success)
+
+    Write-Banner 'REMOVED'
+    if ($disable.RdpClosed) {
+        Write-Kv 'RDP' '已关闭' Green
+    } else {
+        Write-Kv 'RDP' '关闭失败' Red
+    }
+    switch ($disable.RuleStatus) {
+        'Removed' { Write-Kv '受管防火墙规则' '已删除' Green }
+        'NotPresent' { Write-Kv '受管防火墙规则' '不存在（无需删除）' Green }
+        'Conflict' { Write-Kv '受管防火墙规则' '本工具规则不存在；同名非本工具规则保留' Yellow }
+        'Remaining' { Write-Kv '受管防火墙规则' '未完全删除' Red }
+        default { Write-Kv '受管防火墙规则' '状态未知' Yellow }
+    }
+    switch ($delete.Reason) {
+        'Deleted' {
+            Write-Kv '专用账户' '已删除' Green
+        }
+        'NotFound' {
+            Write-Kv '专用账户' '不存在（已删除）' Green
+        }
+        'ActiveSessions' {
+            Write-Kv '专用账户' '保留（存在活动会话）' Yellow
+        }
+        'OwnershipMismatch' {
+            Write-Kv '专用账户' '未删除（说明字段不匹配）' Red
+        }
+        'SidMismatch' {
+            Write-Kv '专用账户' '未删除（SID 与快照不一致）' Red
+        }
+        'StateUnavailable' {
+            Write-Kv '专用账户' '未删除（状态快照不可读）' Red
+        }
+        'SessionCheckFailed' {
+            Write-Kv '专用账户' '未删除（无法确认会话状态）' Red
+        }
+        'AdminRemovalFailed' {
+            Write-Kv '专用账户' '未删除（无法移除管理员成员资格）' Red
+        }
+        'DeleteFailed' {
+            Write-Kv '专用账户' '删除失败' Red
+        }
+        default {
+            Write-Kv '专用账户' '未删除' Red
+        }
+    }
+    Write-Kv '用户配置文件' '保留（未删除）'
+    Write-Kv '状态快照' '保留'
+    Write-Host ''
+    Write-Host '其他 Windows 用户账户未受影响。' -ForegroundColor Gray
+
+    if ($delete.Reason -eq 'ActiveSessions') {
+        Write-Host ''
+        Write-Host '当前账户仍有活动/未注销会话，已保留账户。请先正常注销；本工具不会强制踢出。' -ForegroundColor Yellow
+        foreach ($session in @($delete.Sessions)) {
+            if ($session.Detail) {
+                Write-Host ("  - {0}：{1}" -f $session.Source, $session.Detail) -ForegroundColor Yellow
+            } elseif ($session.LogonType) {
+                Write-Host ("  - {0}：LogonId={1}，LogonType={2}" -f $session.Source, $session.LogonId, $session.LogonType) -ForegroundColor Yellow
+            }
+        }
+    }
+    if ($delete.AdminRemoved) {
+        Write-Warn '账户原先位于 Administrators 组，已移除其管理员成员资格。'
+    }
+
+    if ($disable.Warnings.Count -gt 0) {
+        Write-Host ''
+        Write-Host '警告：' -ForegroundColor Yellow
+        foreach ($warning in @($disable.Warnings)) { Write-Host "  - $warning" -ForegroundColor Yellow }
+    }
+    if ($disable.Errors.Count -gt 0) {
+        Write-Host ''
+        Write-Host '错误：' -ForegroundColor Red
+        foreach ($errorItem in @($disable.Errors)) { Write-Host "  - $errorItem" -ForegroundColor Red }
+    }
+    if ($delete.Reason -eq 'ActiveSessions') {
+        Write-Kv '状态' 'PARTIAL（RDP 已关闭，账户因活动会话保留）' Yellow
+    } elseif ($allOk) {
+        Write-Kv '状态' '已移除' Green
+    } elseif ($disable.RdpClosed) {
+        Write-Kv '状态' 'PARTIAL（账户或规则清理未完全成功）' Yellow
+    } else {
+        Write-Kv '状态' 'FAILED' Red
+    }
+    return $allOk
+}
+
 # ---------------------------------------------------------------------------
 # 帮助和主入口
 # ---------------------------------------------------------------------------
@@ -2379,10 +2920,21 @@ function Invoke-DisableRdp {
 function Show-Help {
     Write-Banner
     Write-Host '用法：' -ForegroundColor Cyan
-    Write-Host '  RDP-QuickAccess.bat                 启用 RDP、创建/轮换独立账户并显示凭证'
-    Write-Host '  RDP-QuickAccess.bat -Status         只读检查当前 RDP、NLA、服务、防火墙、账户和网络地址'
-    Write-Host '  RDP-QuickAccess.bat -Disable        删除本工具创建的账户/防火墙规则，并恢复运行前 RDP 配置'
-    Write-Host '  RDP-QuickAccess.bat -Help           显示本帮助'
+    Write-Host '  RDP-Enable.bat                      开启/维护 RDP、创建或轮换专用账户并显示凭证'
+    Write-Host '  RDP-Disable.bat                     关闭新的 RDP 连接，删除受管防火墙规则；保留账户和快照'
+    Write-Host '  RDP-Delete-Account.bat              只删除受管专用账户；不改变 RDP 和防火墙'
+    Write-Host '  RDP-Disable-And-Delete.bat          关闭 RDP、删除规则，并在无活动会话时删除账户'
+    Write-Host '  RDP-Status.bat                      只读检查当前 RDP、账户、防火墙和网络状态'
+    Write-Host '  RDP-Restore-Original.bat            完整恢复运行前快照'
+    Write-Host '  RDP-QuickAccess.bat                 向后兼容：默认开启；支持 -Status / -Disable / -Help'
+    Write-Host '  RDP-QuickAccess.bat -Disable        旧版兼容别名，等同 RDP-Restore-Original.bat'
+    Write-Host '  RDP-QuickAccess.bat -Help           显示本帮助（不需要管理员权限）'
+    Write-Host ''
+    Write-Host '操作说明：' -ForegroundColor Cyan
+    Write-Host '  * 开启、关闭、删除账户、完整恢复是独立操作，账户生命周期由独立 BAT 显式控制。'
+    Write-Host '  * 关闭窗口不会删除账户；RDP-Disable 只关闭新连接并保留账户和状态快照。'
+    Write-Host '  * 删除账户前检查本地/远程登录会话；存在活动或未注销会话时拒绝删除，不强制注销。'
+    Write-Host '  * RDP-Disable-And-Delete 在账户有活动会话时输出 PARTIAL，并保留账户。'
     Write-Host ''
     Write-Host '安全说明：' -ForegroundColor Yellow
     Write-Host '  * 仅支持 Windows 10/11 专业版、企业版、教育版、专业工作站版；家庭版会被拒绝。'
@@ -2403,20 +2955,51 @@ function Invoke-Main {
         Show-Help
         return 0
     }
-    if ($Status -and $Disable) {
-        throw '参数 -Status 和 -Disable 不能同时使用。'
+
+    $modes = @()
+    if ($Enable) { $modes += 'Enable' }
+    if ($DisableRdp) { $modes += 'DisableRdp' }
+    if ($DeleteAccount) { $modes += 'DeleteAccount' }
+    if ($DisableAndDelete) { $modes += 'DisableAndDelete' }
+    if ($Status) { $modes += 'Status' }
+    if ($RestoreOriginal) { $modes += 'RestoreOriginal' }
+
+    if ($modes.Count -gt 1) {
+        throw '一次只能使用一个操作参数：-Enable / -DisableRdp / -DeleteAccount / -DisableAndDelete / -Status / -RestoreOriginal。旧版 -Disable 等同 -RestoreOriginal。'
     }
-    if ($Status) {
-        Invoke-Status
-        return 0
+
+    $mode = 'Enable'
+    if ($modes.Count -eq 1) { $mode = $modes[0] }
+
+    switch ($mode) {
+        'Enable' {
+            Invoke-EnableRdp
+            return 0
+        }
+        'DisableRdp' {
+            if (Invoke-DisableRdp) { return 0 }
+            return 1
+        }
+        'DeleteAccount' {
+            if (Invoke-DeleteAccount) { return 0 }
+            return 1
+        }
+        'DisableAndDelete' {
+            if (Invoke-DisableAndDelete) { return 0 }
+            return 1
+        }
+        'Status' {
+            Invoke-Status
+            return 0
+        }
+        'RestoreOriginal' {
+            if (Invoke-RestoreOriginal) { return 0 }
+            return 1
+        }
+        default {
+            throw "未知操作模式：$mode"
+        }
     }
-    if ($Disable) {
-        $success = Invoke-DisableRdp
-        if ($success) { return 0 }
-        return 1
-    }
-    Invoke-EnableRdp
-    return 0
 }
 
 try {

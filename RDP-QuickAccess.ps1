@@ -7,10 +7,10 @@
     仅面向局域网 RDP：
       * 启用 RDP Host、强制 NLA，不修改 3389 端口和安全层；
       * 创建独立标准本地账户 rdp_access，使用加密随机密码；
-      * 创建仅允许 LocalSubnet、Domain/Private 的 TCP 3389 防火墙规则；
+      * 创建仅允许 LocalSubnet、Domain/Private/Public 的 TCP 3389 防火墙规则；
       * 自动发现 RFC1918 内网 IPv4 地址；
       * 支持 -Status 只读检查和 -Disable 回滚关闭；
-      * 仅限你控制的可信局域网；LocalSubnet 不等于只有你的设备；
+      * 支持 Public/Private/Domain 网络配置文件；LocalSubnet 不等于只有你的设备；
       * 不保存明文密码，不自动复制密码。
 
 .NOTES
@@ -139,6 +139,16 @@ function Format-NetworkCategory {
         'DomainAuthenticated' { return '域（Domain）' }
         'Public'              { return '公用（Public）' }
         default               { return '未识别' }
+    }
+}
+
+function Get-FirewallProfileNameForCategory {
+    param([string]$Category)
+    switch ($Category) {
+        'Public'              { return 'Public' }
+        'Private'             { return 'Private' }
+        'DomainAuthenticated' { return 'Domain' }
+        default               { throw "无法识别的网络配置文件类别：$Category" }
     }
 }
 
@@ -929,8 +939,11 @@ function Test-FirewallRuleConfiguration {
     if ($profiles -notmatch '(?i)\bPrivate\b') {
         $errors.Add('未包含 Private 网络配置文件')
     }
-    if ($profiles -match '(?i)\bPublic\b' -or $profiles -match '(?i)^Any$') {
-        $errors.Add('包含了 Public/Any 网络配置文件')
+    if ($profiles -notmatch '(?i)\bPublic\b') {
+        $errors.Add('未包含 Public 网络配置文件')
+    }
+    if ($profiles -match '(?i)^Any$') {
+        $errors.Add('网络配置文件不能为 Any，必须明确覆盖 Domain/Private/Public')
     }
 
     $portFilters = @()
@@ -1011,7 +1024,7 @@ function Initialize-FirewallRule {
     }
 
     if ($null -eq $rule) {
-        Write-Info '正在创建防火墙规则（仅 TCP 3389、仅 LocalSubnet、仅 Domain/Private）...'
+        Write-Info '正在创建防火墙规则（仅 TCP 3389、仅 LocalSubnet、Domain/Private/Public）...'
         $newRuleParams = @{
             DisplayName    = $script:FirewallRuleName
             Description    = $script:ManagedDescription
@@ -1021,7 +1034,7 @@ function Initialize-FirewallRule {
             Protocol       = 'TCP'
             LocalPort      = $script:RdpPort
             RemoteAddress  = 'LocalSubnet'
-            Profile        = @('Domain', 'Private')
+            Profile        = @('Domain', 'Private', 'Public')
             Enabled        = 'True'
         }
         New-NetFirewallRule @newRuleParams -ErrorAction Stop | Out-Null
@@ -1030,7 +1043,7 @@ function Initialize-FirewallRule {
         $setRuleParams = @{
             Name           = $rule.Name
             Enabled        = 'True'
-            Profile        = @('Domain', 'Private')
+            Profile        = @('Domain', 'Private', 'Public')
             Action         = 'Allow'
             Protocol       = 'TCP'
             LocalPort      = $script:RdpPort
@@ -1053,7 +1066,7 @@ function Initialize-FirewallRule {
         $State.FirewallRuleCreated = $true
         Save-StateFile -State $State
     }
-    Write-Ok '防火墙规则已验证：TCP 3389，RemoteAddress=LocalSubnet，Profile=Domain/Private。'
+    Write-Ok '防火墙规则已验证：TCP 3389，RemoteAddress=LocalSubnet，Profile=Domain/Private/Public。'
 }
 
 function Get-FirewallProfileStatus {
@@ -1066,6 +1079,7 @@ function Get-FirewallProfileStatus {
 }
 
 function Assert-FirewallReady {
+    param([string[]]$ActiveCategories = @())
     $service = Get-Service -Name 'MpsSvc' -ErrorAction SilentlyContinue
     if ($null -eq $service) {
         throw '未找到 Windows Defender 防火墙服务（MpsSvc），本工具无法安全配置。'
@@ -1080,14 +1094,30 @@ function Assert-FirewallReady {
         throw "无法读取防火墙配置文件状态：$($_.Exception.Message)"
     }
 
-    if (-not $status.Domain) {
-        throw 'Domain 网络配置文件的防火墙未启用。本工具不会擅自开启全局防火墙，请先手动启用后重试。'
+    $categories = @($ActiveCategories)
+    if ($categories.Count -eq 0) {
+        try {
+            $categories = @(Get-ActiveNetworkCategories)
+        } catch {
+            throw "无法读取活动网络配置文件：$($_.Exception.Message)"
+        }
     }
-    if (-not $status.Private) {
-        throw 'Private 网络配置文件的防火墙未启用。本工具不会擅自开启全局防火墙，请先手动启用后重试。'
+
+    if ($categories.Count -eq 0) {
+        Write-Warn '未检测到活动网络连接；无法验证当前配置文件的防火墙状态，将在规则已覆盖三个配置文件的前提下继续。'
     }
-    if (-not $status.Public) {
-        Write-Warn 'Public 网络配置文件的防火墙未启用。本工具不会使用 Public 配置文件，但建议你手动开启系统防火墙。'
+
+    foreach ($category in $categories) {
+        $profileName = Get-FirewallProfileNameForCategory -Category $category
+        if (-not [bool]$status.$profileName) {
+            throw "当前活动的 $profileName 网络配置文件（$category）的 Windows Defender 防火墙未启用。本工具不会自动开启或绕过防火墙；请先手动启用后重试。"
+        }
+    }
+
+    foreach ($profileName in @('Domain', 'Private', 'Public')) {
+        if (-not [bool]$status.$profileName) {
+            Write-Warn "$profileName 防火墙配置文件未启用；规则虽覆盖该配置，但在防火墙关闭时不会生效。"
+        }
     }
     return $status
 }
@@ -1132,18 +1162,14 @@ function Get-RiskyRdpRules {
         $remoteText = ($remotes -join ',')
         $profiles = [string]$rule.Profile
         $anyRemote = ($remoteText -match '(?i)(^|,)\s*Any\s*($|,)')
-        $publicProfile = ($profiles -match '(?i)\bPublic\b' -or $profiles -match '(?i)^Any$')
 
-        if ($anyRemote -or $publicProfile) {
-            $reasons = @()
-            if ($anyRemote) { $reasons += 'RemoteAddress 为 Any' }
-            if ($publicProfile) { $reasons += '包含 Public/Any 配置文件' }
+        if ($anyRemote) {
             $risky.Add([pscustomobject]@{
                 DisplayName   = [string]$rule.DisplayName
                 DisplayGroup  = [string]$rule.DisplayGroup
                 Profile       = $profiles
                 RemoteAddress = $remoteText
-                Reason        = ($reasons -join '；')
+                Reason        = 'RemoteAddress 为 Any'
             })
         }
     }
@@ -1171,38 +1197,37 @@ function Test-PrivateIPv4 {
     return $false
 }
 
-function Assert-SafeNetworkProfile {
+function Get-ActiveNetworkCategories {
     $connections = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
     if ($connections.Count -eq 0) {
+        return @()
+    }
+
+    $categories = @()
+    foreach ($connection in $connections) {
+        $category = [string]$connection.NetworkCategory
+        if ($category -notin @('Public', 'Private', 'DomainAuthenticated')) {
+            throw "无法识别的网络配置文件类别：$category（接口：$($connection.InterfaceAlias)，网络：$($connection.Name)）。本工具不会猜测或绕过未知网络状态。"
+        }
+        if ($categories -notcontains $category) {
+            $categories += $category
+        }
+    }
+    return @($categories)
+}
+
+function Assert-SafeNetworkProfile {
+    $categories = @(Get-ActiveNetworkCategories)
+    if ($categories.Count -eq 0) {
         Write-Warn '未检测到活动网络连接；将继续配置，但当前没有可用于连接的内网地址。'
-        return
+        return @()
     }
 
-    $publicProfiles = @($connections | Where-Object { [string]$_.NetworkCategory -eq 'Public' })
-    if ($publicProfiles.Count -gt 0) {
-        $details = @()
-        foreach ($profile in $publicProfiles) {
-            $details += ("{0}（{1}）" -f $profile.InterfaceAlias, $profile.Name)
-        }
-        $message = @(
-            "检测到 Public 网络配置文件：$($details -join '、')。"
-            "本工具不会自动把 Public 改为 Private，也不会在 Public 网络上开放 RDP。"
-            "Private 只适用于你自己控制的可信局域网（例如家庭或小型办公网络）。"
-            "如果你处于学校宿舍、校园 Wi-Fi、酒店、公共热点等共享网络，请勿改为 Private，也不要启用本工具。"
-            "LocalSubnet 只限制在同一子网内，并不表示只有你的设备能访问；同一子网的其他设备也可能访问 TCP 3389。"
-            "只有在确认网络可信时，才由你手动在 Windows 设置中把该网络改为专用/域网络，然后重试。"
-        ) -join [Environment]::NewLine
-        throw $message
+    if ($categories -contains 'Public') {
+        Write-Info '当前网络配置文件包含 Public；本工具支持该配置文件，并将防火墙规则覆盖 Public。'
+        Write-Warn '防火墙来源仍限制为 LocalSubnet；同一子网中的其他设备也可能访问 TCP 3389。'
     }
-
-    $unsupported = @($connections | Where-Object { [string]$_.NetworkCategory -notin @('Private', 'DomainAuthenticated') })
-    if ($unsupported.Count -gt 0) {
-        $details = @()
-        foreach ($profile in $unsupported) {
-            $details += ("{0}（{1}，{2}）" -f $profile.InterfaceAlias, $profile.Name, $profile.NetworkCategory)
-        }
-        throw "检测到无法安全识别的网络配置文件：$($details -join '、')。本工具仅允许 Private 或 Domain 网络。"
-    }
+    return @($categories)
 }
 
 function Get-NetworkAddresses {
@@ -1281,7 +1306,7 @@ function Get-NetworkAddresses {
         switch ($category) {
             'Private'             { $score += 30; $reasons.Add('专用网络') }
             'DomainAuthenticated' { $score += 25; $reasons.Add('域网络') }
-            'Public'              { $score -= 30; $reasons.Add('Public 网络（不推荐）') }
+            'Public'              { $score += 15; $reasons.Add('Public 网络') }
             default               { $reasons.Add('网络类型未识别') }
         }
         if (-not [string]::IsNullOrWhiteSpace($gateway)) {
@@ -1310,7 +1335,7 @@ function Get-NetworkAddresses {
     if ($list.Count -gt 0) {
         $preferred = @($list | Where-Object {
             (-not $_.IsVirtual) -and (-not $_.IsVpn) -and
-            ([string]$_.NetworkCategory -in @('Private', 'DomainAuthenticated'))
+            ([string]$_.NetworkCategory -in @('Private', 'DomainAuthenticated', 'Public'))
         })
 
         if ($preferred.Count -eq 0) {
@@ -1440,16 +1465,15 @@ function Test-RdpEnabledState {
 
     try {
         $firewall = Get-FirewallProfileStatus
-        if (-not $firewall.Domain) { $errors.Add('Domain 防火墙配置文件未启用') }
-        if (-not $firewall.Private) { $errors.Add('Private 防火墙配置文件未启用') }
+        $activeCategories = @(Get-ActiveNetworkCategories)
+        foreach ($category in $activeCategories) {
+            $profileName = Get-FirewallProfileNameForCategory -Category $category
+            if (-not [bool]$firewall.$profileName) {
+                $errors.Add("当前活动的 $profileName 防火墙配置文件未启用")
+            }
+        }
     } catch {
-        $errors.Add("无法读取防火墙状态：$($_.Exception.Message)")
-    }
-
-    $connections = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
-    $publicConnections = @($connections | Where-Object { [string]$_.NetworkCategory -eq 'Public' })
-    if ($publicConnections.Count -gt 0) {
-        $errors.Add('当前存在 Public 网络配置文件，不满足安全启用条件')
+        $errors.Add("无法验证活动网络/防火墙状态：$($_.Exception.Message)")
     }
 
     return [pscustomobject]@{
@@ -1469,7 +1493,9 @@ function Show-EnableResult {
     param(
         [Parameter(Mandatory = $true)][string]$Password,
         $Addresses,
-        $RdpState
+        $RdpState,
+        [string[]]$ActiveCategories = @(),
+        $FirewallProfiles
     )
 
     Write-Banner
@@ -1489,21 +1515,49 @@ function Show-EnableResult {
     Write-Host '  请立即记录并妥善保存；关闭窗口后无法再次查看。' -ForegroundColor Red
     Write-Host '  连接时请使用该独立账户，不要使用 Windows 主账户密码。' -ForegroundColor Gray
 
+    $categoryList = @($ActiveCategories)
+    $categoryText = '未检测到'
+    if ($categoryList.Count -gt 0) {
+        $categoryText = ($categoryList -join ' / ')
+    }
+    $disabledProfiles = @()
+    if ($null -ne $FirewallProfiles) {
+        foreach ($profileName in @('Domain', 'Private', 'Public')) {
+            if (-not [bool]$FirewallProfiles.$profileName) {
+                $disabledProfiles += $profileName
+            }
+        }
+    }
+
+    $firewallText = '已启用（活动配置文件）'
+    $firewallColor = [ConsoleColor]::Green
+    if ($categoryList.Count -eq 0) {
+        $firewallText = '未检测到活动网络，无法验证当前配置文件'
+        $firewallColor = [ConsoleColor]::Yellow
+    }
+
     Write-Section '安全状态'
-    Write-Kv '防火墙' '已启用' Green
-    Write-Kv '防火墙规则' '仅允许本地子网（TCP 3389，Domain/Private）' Green
-    Write-Kv '网络配置文件' (Get-ActiveNetworkProfileSummary)
+    Write-Kv '防火墙' $firewallText $firewallColor
+    Write-Kv '防火墙规则' '仅允许本地子网（TCP 3389，Domain/Private/Public）' Green
+    Write-Kv '网络配置文件' $categoryText
+    Write-Kv 'RDP 接入' '已允许' Green
+    Write-Kv '防火墙范围' 'Public / Private / Domain' Green
+    Write-Kv '允许来源' 'LocalSubnet' Green
+    Write-Kv 'TCP 端口' ([string]$script:RdpPort)
     Write-Kv 'NLA' '已启用' Green
     Write-Kv 'RDP 安全层' (Format-SecurityLayer -RegistryValueInfo $RdpState.SecurityLayer)
     if ([bool]$RdpState.SecurityLayer.Exists -and [int]$RdpState.SecurityLayer.Value -lt 2) {
         Write-Warn '当前安全层低于建议值 2；本工具没有降低或修改该值，请管理员评估。'
     }
     Write-Kv '公网端口映射' '未由本工具配置（路由器侧请自行核查）'
+    if ($disabledProfiles.Count -gt 0) {
+        Write-Warn "以下防火墙配置文件未启用：$($disabledProfiles -join '、')。规则覆盖这些 Profile，但在防火墙关闭的配置下不会生效。"
+    }
 
     Write-Host ''
-    Write-Host '安全边界：本工具仅面向可信局域网。LocalSubnet 不等于“只有你的设备”；同一子网的其他设备也可能访问 3389。' -ForegroundColor Yellow
-    Write-Host '不要在学校宿舍、校园 Wi-Fi、酒店、公共热点等共享网络启用；不要把 3389 映射到公网。' -ForegroundColor Yellow
-    Write-Host '如果该网络不在你的控制之下，请立即运行 -Disable，并检查防火墙规则。' -ForegroundColor Yellow
+    Write-Host '连接范围：本工具支持 Public/Private/Domain，但防火墙规则来源仍为 LocalSubnet。' -ForegroundColor Yellow
+    Write-Host '同一子网中的其他设备也可能访问 TCP 3389；不同路由网段、VPN、CGNAT、路由器 NAT、客户端隔离或 ACL 不保证可达。' -ForegroundColor Yellow
+    Write-Host '本工具不承诺任意互联网环境下的远程连接；不会自动修改网络配置文件类型。' -ForegroundColor DarkGray
     Write-Host '首次连接可能出现 RDP 证书警告；请在确认目标计算机名后继续。' -ForegroundColor DarkGray
 
     $list = @($Addresses)
@@ -1567,8 +1621,8 @@ function Invoke-EnableRdp {
         throw "系统 RDP 端口为 $($rdpBefore.PortValue)，不是 3389。本工具不修改端口，已停止。请先恢复默认端口或手动处理。"
     }
 
-    $firewallProfiles = Assert-FirewallReady
-    Assert-SafeNetworkProfile
+    $activeCategories = @(Assert-SafeNetworkProfile)
+    $firewallProfiles = Assert-FirewallReady -ActiveCategories $activeCategories
 
     $account = Get-RdpAccountInfo
     if ($account.Exists -and -not $account.DescriptionMatches) {
@@ -1605,7 +1659,7 @@ function Invoke-EnableRdp {
                 foreach ($risky in $riskyRules) {
                     Write-Host ("  - {0} | Profile={1} | RemoteAddress={2} | {3}" -f $risky.DisplayName, $risky.Profile, $risky.RemoteAddress, $risky.Reason) -ForegroundColor Yellow
                 }
-                Write-Warn '如果这些规则允许 Public 或 Any 远程地址，RDP 可能被暴露；请管理员核查。'
+                Write-Warn '这些规则允许任意远程地址，可能扩大暴露范围；请管理员核查。'
             }
         } catch {
             Write-Warn "检查现有 3389 入站规则失败：$($_.Exception.Message)"
@@ -1622,7 +1676,7 @@ function Invoke-EnableRdp {
         }
 
         $addresses = @(Get-NetworkAddresses)
-        Show-EnableResult -Password $password -Addresses $addresses -RdpState $after
+        Show-EnableResult -Password $password -Addresses $addresses -RdpState $after -ActiveCategories $activeCategories -FirewallProfiles $firewallProfiles
     } finally {
         $password = $null
     }
@@ -1757,7 +1811,7 @@ function Invoke-Status {
     } elseif ([string]$rules[0].Description -cne $script:ManagedDescription) {
         Write-Kv '本工具防火墙规则' '同名规则存在，但说明字段不匹配（非本工具管理）' Red
     } elseif ($ruleErrors.Count -eq 0) {
-        Write-Kv '本工具防火墙规则' '已启用，TCP 3389，仅 LocalSubnet，Domain/Private' Green
+        Write-Kv '本工具防火墙规则' '已启用，TCP 3389，仅 LocalSubnet，Domain/Private/Public' Green
     } else {
         Write-Kv '本工具防火墙规则' '配置异常' Red
         foreach ($ruleError in $ruleErrors) {
@@ -1802,16 +1856,31 @@ function Invoke-Status {
 
     Write-Section '网络地址'
     $connections = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
-    $publicConnections = @()
+    $activeCategories = @()
+    try {
+        $activeCategories = @(Get-ActiveNetworkCategories)
+    } catch {
+        Write-Warn "无法读取网络配置文件类别：$($_.Exception.Message)"
+    }
+    Write-Kv '支持的网络配置文件' 'Public / Private / Domain'
     if ($connections.Count -eq 0) {
         Write-Warn '未检测到活动网络连接。'
     } else {
         foreach ($connection in $connections) {
             Write-Host ("网络：{0} | 配置文件：{1} | 接口：{2}" -f $connection.Name, (Format-NetworkCategory -Category ([string]$connection.NetworkCategory)), $connection.InterfaceAlias) -ForegroundColor Gray
         }
-        $publicConnections = @($connections | Where-Object { [string]$_.NetworkCategory -eq 'Public' })
-        if ($publicConnections.Count -gt 0) {
-            Write-Warn '当前存在 Public 网络配置文件；不满足本工具的安全启用条件。Private 只适用于可信网络；不要在学校/酒店/公共热点等共享网络改为 Private。本工具不会自动修改网络配置文件。'
+        if ($activeCategories -contains 'Public') {
+            Write-Info '当前网络配置文件：Public'
+            Write-Info '本工具支持该配置文件。'
+            if ($ruleOk) {
+                Write-Ok 'RDP 防火墙规则覆盖 Public。'
+            } else {
+                Write-Warn 'RDP 防火墙规则未完整覆盖 Public，当前配置不完整。'
+            }
+            Write-Info '来源限制：LocalSubnet。'
+            Write-Warn '注意：同一子网中的其他设备也可能访问 TCP 3389。'
+        } else {
+            Write-Info '防火墙来源限制：LocalSubnet；同一子网中的其他设备也可能访问 TCP 3389。'
         }
     }
     $addresses = @()
@@ -1870,10 +1939,6 @@ function Invoke-Status {
     $riskCount = 0
     if (-not $support.Supported) {
         Write-Warn $support.Reason
-        $riskCount++
-    }
-    if ($publicConnections.Count -gt 0) {
-        Write-Warn '当前网络包含 Public 配置文件；启用操作会被本工具阻止。'
         $riskCount++
     }
     if ($riskyRules.Count -gt 0) {
@@ -2321,10 +2386,10 @@ function Show-Help {
     Write-Host ''
     Write-Host '安全说明：' -ForegroundColor Yellow
     Write-Host '  * 仅支持 Windows 10/11 专业版、企业版、教育版、专业工作站版；家庭版会被拒绝。'
-    Write-Host '  * 仅创建 LocalSubnet + Domain/Private 的 TCP 3389 入站规则，不开放 Public。'
-    Write-Host '  * 仅建议在自己控制的可信局域网使用；不要在学校宿舍、校园 Wi-Fi、酒店、公共热点等共享网络启用。'
-    Write-Host '  * LocalSubnet 不等于“只有我的设备”；同一子网中的其他设备也可能访问 TCP 3389。'
-    Write-Host '  * Public 网络会被拒绝；仅在确认可信时由你手动改为 Private/Domain，工具不会自动改。'
+    Write-Host '  * 创建 LocalSubnet + Domain/Private/Public 的 TCP 3389 入站规则；RemoteAddress 仍为 LocalSubnet。'
+    Write-Host '  * 支持 Public/Private/Domain 网络配置文件；不会自动修改网络配置文件类型。'
+    Write-Host '  * LocalSubnet 不等于“只有我的设备”；同一局域网或 Public Wi-Fi 上的其他设备也可能访问 TCP 3389。'
+    Write-Host '  * 不同路由网段、VPN、CGNAT、路由器 NAT、客户端隔离或 ACL 不保证可达；不承诺任意互联网环境下的远程连接。'
     Write-Host '  * 不关闭防火墙、不修改 3389 端口、不降低 NLA/安全层、不修改全局密码策略。'
     Write-Host '  * 独立本地账户 rdp_access，不是 Windows 主账户，也不是 MFA/双因素认证。'
     Write-Host '  * 密码仅在启用成功后显示一次，不保存、不写日志、不自动复制到剪贴板。'
